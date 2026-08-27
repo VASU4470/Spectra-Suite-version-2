@@ -4,38 +4,21 @@ import traceback
 
 try:
     # --- YOUR ACTUAL IR.PY CODE STARTS HERE ---
-    import pandas as pd
     import numpy as np
     from pathlib import Path
     from datetime import datetime
     import tkinter as tk
     from tkinter import messagebox
     from config import state
-    from gui import SetupGUI, PlotViewer    
+    from gui import SetupGUI, PlotViewer
+    from theme import apply_theme
+    from readers import robust_read_spectrum as robust_read_ftir
 
     # (The imports at the top of your file stay exactly the same)
 
-    def robust_read_ftir(filepath):
-        if filepath.suffix.lower() == '.xlsx':
-            df = pd.read_excel(filepath, header=None)
-            df = df.apply(pd.to_numeric, errors='coerce').dropna()
-            if not df.empty and df.shape[1] >= 2:
-                return df.iloc[:, 0].values, df.iloc[:, 1].values
-            return np.array([]), np.array([])
-            
-        data_x, data_y = [], []
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                clean_line = line.replace('\t', ',').replace(';', ',').replace(' ', ',')
-                parts = [p for p in clean_line.split(',') if p.strip()]
-                if len(parts) >= 2:
-                    try:
-                        data_x.append(float(parts[0]))
-                        data_y.append(float(parts[1]))
-                    except ValueError:
-                        pass 
-                        
-        return np.array(data_x), np.array(data_y)
+    # robust_read_ftir is now imported from readers.py (was duplicated here
+    # and in xrd.py -- unified after confirming byte-for-byte equivalent
+    # parsing behavior for comma/tab/space/semicolon-delimited input).
 
     def load_data_files(root_window):
         # We unified the files logic in gui.py, so we just read from state.settings['files']
@@ -76,57 +59,110 @@ try:
                
         from config import state
         state.technique = 'FTIR'
-        
+
         # ==========================================
-        # RETRY LOOP: Keeps app open if files fail
+        # OUTER LOOP: each pass is one full "setup -> view -> exit/menu" cycle.
+        # A pass ends either by exiting (handled directly via os._exit in
+        # PlotViewer.on_close, which never returns here) or by the user picking
+        # "Return to Menu", which sets state.restart_to_menu and loops back to
+        # SetupGUI below instead of the old, broken os.execl re-exec.
         # ==========================================
         while True:
-            state.all_data.clear() # Clear out old memory if we are retrying
-            
-            root = tk.Tk()
-            setup_app = SetupGUI(root)
-            root.mainloop()
+            state.restart_to_menu = False
+            state.mode_switched_mid_session = False
 
-            if not setup_app.ready: 
-                sys.exit() # If they clicked the red X to close the window, actually close.
+            # ==========================================
+            # RETRY LOOP: Keeps app open if files fail
+            # ==========================================
+            while True:
+                state.all_data.clear() # Clear out old memory if we are retrying
 
-            dummy_root = tk.Tk()
-            dummy_root.withdraw() 
+                root = tk.Tk()
+                apply_theme(root)  # no-op if sv-ttk isn't installed
+                setup_app = SetupGUI(root)
+                root.mainloop()
 
-            if getattr(setup_app, 'loaded_from_session', False):
-                break # Success! Break the loop and go to plotter.
-            else:
-                if load_data_files(dummy_root):
-                    state.init_file_settings()
+                if not setup_app.ready:
+                    sys.exit() # If they clicked the red X to close the window, actually close.
+
+                dummy_root = tk.Tk()
+                apply_theme(dummy_root)  # PlotViewer/CloseDialog/etc. are Toplevels of this root, so they inherit it
+                dummy_root.withdraw()
+
+                if getattr(setup_app, 'loaded_from_session', False):
                     break # Success! Break the loop and go to plotter.
                 else:
-                    # FAILED! Destroy hidden window, 'continue' restarts the loop to show SetupGUI
-                    dummy_root.destroy()
-                    continue 
-        # ==========================================
+                    if load_data_files(dummy_root):
+                        state.init_file_settings()
+                        break # Success! Break the loop and go to plotter.
+                    else:
+                        # FAILED! Destroy hidden window, 'continue' restarts the loop to show SetupGUI
+                        dummy_root.destroy()
+                        continue
+            # ==========================================
 
-        mode = state.settings.get('mode', 'individual')
+            mode = state.settings.get('mode', 'individual')
 
-        if mode in ['overlay', 'stack']:
-            title = "Overlay Mode" if mode == 'overlay' else "Stacked Grid Mode"
-            
-            # Note: We removed the 'out_dir=' argument from PlotViewer here
-            viewer = PlotViewer(dummy_root, state.all_data, title, out_dir=None)
-            dummy_root.wait_window(viewer)
-            
-        elif mode == 'individual':
-            for i, data_tuple in enumerate(state.all_data):
-                stem = data_tuple[0]
-                
-                # 👻 GHOST SUB-FOLDER CREATION DELETED FROM HERE! 👻
-                
-                viewer = PlotViewer(dummy_root, [data_tuple], f"File {i+1}/{len(state.all_data)}: {stem}", out_dir=None)
+            if mode in ['overlay', 'stack']:
+                title = "Overlay Mode" if mode == 'overlay' else "Stacked Grid Mode"
+
+                # Note: We removed the 'out_dir=' argument from PlotViewer here
+                viewer = PlotViewer(dummy_root, state.all_data, title, out_dir=None)
                 dummy_root.wait_window(viewer)
 
-        dummy_root.destroy()
+            elif mode == 'individual':
+                for i, data_tuple in enumerate(state.all_data):
+                    stem = data_tuple[0]
+
+                    viewer = PlotViewer(dummy_root, [data_tuple], f"File {i+1}/{len(state.all_data)}: {stem}", out_dir=None)
+                    dummy_root.wait_window(viewer)
+
+                    if state.restart_to_menu:
+                        # User asked to return to the main menu mid-way through
+                        # a multi-file individual run -- stop showing the rest.
+                        break
+                    if state.mode_switched_mid_session:
+                        # User used "Add File(s)" -> Overlay/Stack from inside
+                        # the window that just closed. state.all_data now
+                        # contains file(s) this loop never expected, already
+                        # shown together in that window -- continuing here
+                        # would pop open a second, stale individual-mode
+                        # window for them. Stop; the session is effectively
+                        # already finished.
+                        break
+
+            dummy_root.destroy()
+
+            if not state.restart_to_menu:
+                break # Normal end of this pass (the "exit" path already terminated the process directly)
+            # else: loop back around to the top and show SetupGUI again
+        # ==========================================
+
+    def run():
+        """Entry point for launcher.py's multiprocessing.Process(target=...).
+
+        The module-level try/except wrapping this whole file only guards the
+        *initial import* of ir.py -- it does NOT wrap later calls to main()
+        made via multiprocessing.Process(target=ir.main), since that call
+        happens well outside this try block's dynamic extent. That meant any
+        exception inside main() silently killed the child process with no
+        error message at all -- indistinguishable from "the window just
+        never opened." This wrapper gives main() its own crash handling that
+        actually fires regardless of how it's invoked.
+        """
+        try:
+            main()
+        except Exception:
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", "CRASH_REPORT.txt")
+            try:
+                with open(desktop_path, "w") as f:
+                    f.write("THE APP CRASHED. HERE IS THE EXACT ERROR:\n\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
 
     if __name__ == "__main__":
-        main()
+        run()
 
 # --- THE FAILSAFE ---
 except Exception as e:

@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use('TkAgg') 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import matplotlib.colors as mcolors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.widgets import Cursor
 # --------------------------------------------------------------------------------
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from config import state
 from processing import process_spectrum
+from annotations import AnnotationManager
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -163,6 +165,12 @@ class SetupGUI:
         elif getattr(state, 'technique', 'FTIR') == 'XRD':
             ttk.Label(info_frame, text="X-Ray Diffraction:", font=("Arial", 10, "bold")).pack(anchor="w")
             ttk.Label(info_frame, text="• .csv or .txt or .xy or .dat or (Standard 2-Column X/Y Numeric Data)").pack(anchor="w", padx=10, pady=(2, 0))
+
+        # General Plotter (any delimited/xlsx data -- columns configured next)
+        elif getattr(state, 'technique', 'FTIR') == 'GENERAL':
+            ttk.Label(info_frame, text="General Data Plotter:", font=("Arial", 10, "bold")).pack(anchor="w")
+            ttk.Label(info_frame, text="• Any delimited text or Excel file with numeric X/Y columns.\n  You'll configure the delimiter, header rows, and columns next.",
+                      justify="left").pack(anchor="w", padx=10, pady=(2, 0))
         # ==========================================
         
         ttk.Button(self.root, text="🚀 Launch Processing", command=self.start).pack(pady=10)
@@ -314,6 +322,346 @@ class CloseDialog(tk.Toplevel):
         self.choice = f"{action}_{destination}"
         self.destroy()
 
+
+class AddDataChoiceDialog(tk.Toplevel):
+    """Shown when 'Add File(s)' is used in Individual mode with data already
+    loaded -- Individual mode only ever shows one file at a time, so adding
+    another file is ambiguous. Asks whether the new file should replace the
+    one currently on screen, or whether the whole session should switch to
+    Overlay/Stack mode so everything can be shown together."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add Data")
+        self.geometry("400x260")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.choice = None  # 'replace' | 'overlay' | 'stack' | None (cancelled)
+
+        ttk.Label(self, text="You're in Individual mode with data already loaded.",
+                  font=("Arial", 10, "bold"), wraplength=360, justify="center").pack(pady=(15, 2), padx=15)
+        ttk.Label(self, text="How should the new file(s) be added?",
+                  wraplength=360, justify="center").pack(pady=(0, 15), padx=15)
+
+        ttk.Button(self, text="🔁 Replace Current File's Data", width=34,
+                   command=lambda: self._pick('replace')).pack(pady=4)
+        ttk.Button(self, text="🗂 Switch to Overlay (same axes)", width=34,
+                   command=lambda: self._pick('overlay')).pack(pady=4)
+        ttk.Button(self, text="📊 Switch to Stacked Grid", width=34,
+                   command=lambda: self._pick('stack')).pack(pady=4)
+        ttk.Button(self, text="Cancel", width=34, command=self.destroy).pack(pady=(12, 4))
+
+    def _pick(self, choice):
+        self.choice = choice
+        self.destroy()
+
+
+class ColumnPickerDialog(tk.Toplevel):
+    """Used by the General Plotter to configure how to parse arbitrary data:
+    delimiter, header rows to skip, and which columns are X/Y. Shows a live
+    preview (raw + parsed) from a sample file so the user can confirm the
+    configuration looks right before committing to it for all selected files."""
+    def __init__(self, parent, sample_filepath):
+        super().__init__(parent)
+        self.title("Configure Data Columns")
+        self.geometry("580x560")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.sample_filepath = sample_filepath
+        self.result = None  # dict on OK, stays None on Cancel
+
+        self.var_delimiter = tk.StringVar(value='Comma (,)')
+        self.var_skip_rows = tk.IntVar(value=0)
+        self.var_x_col = tk.IntVar(value=0)
+        self.var_y_col = tk.IntVar(value=1)
+
+        self._build_ui()
+        self._refresh_preview()
+
+    def _build_ui(self):
+        ttk.Label(self, text=f"Sample file: {Path(self.sample_filepath).name}",
+                  font=("Arial", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
+        ttk.Label(self, text="Raw preview (first 8 lines):", font=("Arial", 9)).pack(anchor="w", padx=10, pady=(6, 2))
+        self.raw_text = tk.Text(self, height=6, width=68, font=("Courier", 9))
+        self.raw_text.pack(padx=10, pady=(0, 10))
+        self.raw_text.config(state="disabled")
+
+        opts_frame = ttk.LabelFrame(self, text="Parsing Options", padding=10)
+        opts_frame.pack(fill="x", padx=10, pady=5)
+
+        row1 = ttk.Frame(opts_frame); row1.pack(fill="x", pady=2)
+        ttk.Label(row1, text="Delimiter:").pack(side="left")
+        delim_options = ['Comma (,)', 'Tab', 'Space', 'Semicolon (;)']
+        cb = ttk.Combobox(row1, textvariable=self.var_delimiter, values=delim_options, state="readonly", width=14)
+        cb.pack(side="left", padx=5)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_preview())
+
+        row2 = ttk.Frame(opts_frame); row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="Header Rows to Skip:").pack(side="left")
+        ttk.Spinbox(row2, from_=0, to=50, textvariable=self.var_skip_rows, width=5,
+                    command=self._refresh_preview).pack(side="left", padx=5)
+
+        row3 = ttk.Frame(opts_frame); row3.pack(fill="x", pady=2)
+        ttk.Label(row3, text="X Column Index:").pack(side="left")
+        ttk.Spinbox(row3, from_=0, to=20, textvariable=self.var_x_col, width=5,
+                    command=self._refresh_preview).pack(side="left", padx=5)
+        ttk.Label(row3, text="Y Column Index:").pack(side="left", padx=(15, 0))
+        ttk.Spinbox(row3, from_=0, to=20, textvariable=self.var_y_col, width=5,
+                    command=self._refresh_preview).pack(side="left", padx=5)
+        ttk.Label(opts_frame, text="(0 = first column)", font=("Arial", 8), foreground="gray").pack(anchor="w")
+
+        ttk.Button(opts_frame, text="🔄 Refresh Preview", command=self._refresh_preview).pack(pady=(8, 0))
+
+        ttk.Label(self, text="Parsed preview (first 5 numeric rows):", font=("Arial", 9)).pack(anchor="w", padx=10, pady=(10, 2))
+        self.parsed_text = tk.Text(self, height=6, width=68, font=("Courier", 9))
+        self.parsed_text.pack(padx=10, pady=(0, 10))
+        self.parsed_text.config(state="disabled")
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="Cancel", command=self._cancel).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="✅ Use This Configuration", command=self._confirm).pack(side="right")
+
+    def _delim_char(self):
+        mapping = {'Comma (,)': ',', 'Tab': '\t', 'Space': ' ', 'Semicolon (;)': ';'}
+        return mapping.get(self.var_delimiter.get(), ',')
+
+    def _refresh_preview(self):
+        lines = []
+        try:
+            with open(self.sample_filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                for _ in range(8):
+                    line = f.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+        except Exception as e:
+            lines = [f"(Could not read file: {e})"]
+
+        self.raw_text.config(state="normal")
+        self.raw_text.delete("1.0", tk.END)
+        self.raw_text.insert("1.0", "".join(lines))
+        self.raw_text.config(state="disabled")
+
+        from readers import read_generic_configured
+        try:
+            x, y = read_generic_configured(
+                Path(self.sample_filepath),
+                delimiter=self._delim_char(),
+                skip_rows=self.var_skip_rows.get(),
+                x_col=self.var_x_col.get(),
+                y_col=self.var_y_col.get(),
+            )
+            rows = list(zip(x, y))[:5]
+            preview = "\n".join(f"{xi:.4g}\t{yi:.4g}" for xi, yi in rows) if rows else \
+                "(No numeric rows parsed with this configuration -- try adjusting the options above)"
+        except Exception as e:
+            preview = f"(Error: {e})"
+
+        self.parsed_text.config(state="normal")
+        self.parsed_text.delete("1.0", tk.END)
+        self.parsed_text.insert("1.0", preview)
+        self.parsed_text.config(state="disabled")
+
+    def _confirm(self):
+        self.result = {
+            'delimiter': self._delim_char(),
+            'skip_rows': self.var_skip_rows.get(),
+            'x_col': self.var_x_col.get(),
+            'y_col': self.var_y_col.get(),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class TextAnnotationDialog(tk.Toplevel):
+    """Rich text-composition dialog for annotation text boxes.
+
+    Superscript/subscript/Greek letters/underline are implemented via
+    matplotlib's built-in mathtext (the '$...$' syntax) -- no LaTeX
+    installation needed, it's part of matplotlib itself. Bold/italic/color/
+    size for plain (non-mathtext) text use the Text artist's native
+    fontweight/fontstyle/color/fontsize properties instead, since those work
+    everywhere (not just inside '$...$').
+    """
+
+    GREEK_LOWER = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta',
+                   'iota', 'kappa', 'lambda', 'mu', 'nu', 'xi', 'pi', 'rho', 'sigma',
+                   'tau', 'upsilon', 'phi', 'chi', 'psi', 'omega']
+    GREEK_UPPER = ['Gamma', 'Delta', 'Theta', 'Lambda', 'Xi', 'Pi', 'Sigma', 'Upsilon', 'Phi', 'Psi', 'Omega']
+    MATH_SYMBOLS = [
+        ('±', '\\pm'), ('×', '\\times'), ('÷', '\\div'), ('≈', '\\approx'),
+        ('≠', '\\neq'), ('≤', '\\leq'), ('≥', '\\geq'), ('∞', '\\infty'),
+        ('√', '\\sqrt{}'), ('∑', '\\sum'), ('∫', '\\int'), ('°', '^{\\circ}'),
+        ('→', '\\rightarrow'), ('∂', '\\partial'), ('Å', '\\AA'), ('∆', '\\Delta'),
+    ]
+    GREEK_UNICODE = {
+        '\\alpha': 'α', '\\beta': 'β', '\\gamma': 'γ', '\\delta': 'δ', '\\epsilon': 'ε', '\\zeta': 'ζ',
+        '\\eta': 'η', '\\theta': 'θ', '\\iota': 'ι', '\\kappa': 'κ', '\\lambda': 'λ', '\\mu': 'μ',
+        '\\nu': 'ν', '\\xi': 'ξ', '\\pi': 'π', '\\rho': 'ρ', '\\sigma': 'σ', '\\tau': 'τ',
+        '\\upsilon': 'υ', '\\phi': 'φ', '\\chi': 'χ', '\\psi': 'ψ', '\\omega': 'ω',
+        '\\Gamma': 'Γ', '\\Delta': 'Δ', '\\Theta': 'Θ', '\\Lambda': 'Λ', '\\Xi': 'Ξ', '\\Pi': 'Π',
+        '\\Sigma': 'Σ', '\\Upsilon': 'Υ', '\\Phi': 'Φ', '\\Psi': 'Ψ', '\\Omega': 'Ω',
+    }
+
+    def __init__(self, parent, initial_text='', initial_color='black', initial_fontsize=12,
+                 initial_bold=False, initial_italic=False, initial_family='sans-serif'):
+        super().__init__(parent)
+        self.title("Add Text Annotation")
+        self.geometry("540x660")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None  # dict on OK/Add, stays None on Cancel
+
+        self.var_color = tk.StringVar(value=initial_color)
+        self.var_fontsize = tk.DoubleVar(value=initial_fontsize)
+        self.var_bold = tk.BooleanVar(value=initial_bold)
+        self.var_italic = tk.BooleanVar(value=initial_italic)
+        self.var_underline = tk.BooleanVar(value=False)
+        self.var_family = tk.StringVar(value=initial_family or 'sans-serif')
+
+        self._build_ui(initial_text)
+
+    def _build_ui(self, initial_text):
+        ttk.Label(self, text="Text (use the buttons below to insert formatting/symbols at the cursor):",
+                  wraplength=500, justify="left").pack(anchor="w", padx=10, pady=(10, 4))
+
+        self.text_entry = tk.Text(self, height=4, width=60, font=("Arial", 11), wrap="word")
+        self.text_entry.pack(padx=10, pady=(0, 8))
+        self.text_entry.insert("1.0", initial_text)
+        self.text_entry.focus_set()
+
+        # --- Whole-box style ---
+        style_frame = ttk.LabelFrame(self, text="Style (applies to the whole box)", padding=6)
+        style_frame.pack(fill="x", padx=10, pady=4)
+
+        style_row = ttk.Frame(style_frame)
+        style_row.pack(fill="x")
+        ttk.Checkbutton(style_row, text="Bold", variable=self.var_bold).pack(side="left", padx=4)
+        ttk.Checkbutton(style_row, text="Italic", variable=self.var_italic).pack(side="left", padx=4)
+        ttk.Checkbutton(style_row, text="Underline", variable=self.var_underline).pack(side="left", padx=4)
+        ttk.Label(style_row, text="  Size:").pack(side="left", padx=(10, 0))
+        ttk.Entry(style_row, textvariable=self.var_fontsize, width=5).pack(side="left")
+
+        style_row2 = ttk.Frame(style_frame)
+        style_row2.pack(fill="x", pady=(4, 0))
+        ttk.Label(style_row2, text="Font:").pack(side="left")
+        ttk.Combobox(style_row2, textvariable=self.var_family, state="readonly", width=11,
+                     values=["sans-serif", "serif", "monospace", "cursive", "fantasy"]).pack(side="left", padx=4)
+        ttk.Label(style_row2, text="  Color:").pack(side="left", padx=(10, 0))
+        ttk.Entry(style_row2, textvariable=self.var_color, width=10).pack(side="left")
+        ttk.Button(style_row2, text="🎨", width=3, command=self._choose_color).pack(side="left", padx=2)
+
+        # --- Superscript / subscript ---
+        insert_frame = ttk.LabelFrame(self, text="Insert at Cursor", padding=6)
+        insert_frame.pack(fill="x", padx=10, pady=4)
+        row1 = ttk.Frame(insert_frame)
+        row1.pack(fill="x", pady=2)
+        ttk.Button(row1, text="x² Superscript", command=self._insert_superscript).pack(side="left", padx=2)
+        ttk.Button(row1, text="x₂ Subscript", command=self._insert_subscript).pack(side="left", padx=2)
+
+        # --- Greek letters ---
+        greek_frame = ttk.LabelFrame(self, text="Greek Letters (click to insert)", padding=6)
+        greek_frame.pack(fill="x", padx=10, pady=4)
+        greek_specs = [(self.GREEK_UNICODE.get(f"\\{n}", n), f"\\{n}") for n in self.GREEK_LOWER] + \
+                      [(self.GREEK_UNICODE.get(f"\\{n}", n), f"\\{n}") for n in self.GREEK_UPPER]
+        self._build_symbol_grid(greek_frame, greek_specs, cols=12)
+
+        # --- Math symbols ---
+        sym_frame = ttk.LabelFrame(self, text="Math Symbols (click to insert)", padding=6)
+        sym_frame.pack(fill="x", padx=10, pady=4)
+        self._build_symbol_grid(sym_frame, self.MATH_SYMBOLS, cols=8)
+
+        ttk.Label(self, text="These buttons use matplotlib's built-in math mode ($...$) so everything\n"
+                              "renders correctly on the graph -- no LaTeX installation needed.",
+                  font=("Arial", 8), foreground="gray", justify="left").pack(anchor="w", padx=10, pady=(4, 0))
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=10, pady=10)
+        ttk.Button(btn_frame, text="Cancel", command=self._cancel).pack(side="right", padx=5)
+        ttk.Button(btn_frame, text="✅ Add", command=self._confirm).pack(side="right")
+
+    def _build_symbol_grid(self, parent, specs, cols):
+        for i, (label, cmd) in enumerate(specs):
+            btn = tk.Button(parent, text=label, width=3, command=lambda c=cmd: self._insert_mathtext(c))
+            btn.grid(row=i // cols, column=i % cols, padx=1, pady=1)
+
+    def _insert_mathtext(self, cmd):
+        self._ensure_math_wrap_and_insert(cmd + " ")
+
+    def _insert_superscript(self):
+        self._ensure_math_wrap_and_insert("^{}", cursor_offset=-1)
+
+    def _insert_subscript(self):
+        self._ensure_math_wrap_and_insert("_{}", cursor_offset=-1)
+
+    def _ensure_math_wrap_and_insert(self, snippet, cursor_offset=0):
+        """Mathtext commands only render inside '$...$'. If the box isn't
+        already wrapped, wrap the whole current content once, then insert
+        `snippet` at the (adjusted) cursor position."""
+        content = self.text_entry.get("1.0", "end-1c")
+        if not (content.startswith('$') and content.endswith('$') and len(content) >= 2):
+            self.text_entry.delete("1.0", tk.END)
+            self.text_entry.insert("1.0", f"${content}$")
+            insert_index = "end-2c"  # just before the trailing $
+        else:
+            insert_index = tk.INSERT
+            if self.text_entry.compare(insert_index, ">=", "end-1c"):
+                insert_index = "end-2c"
+
+        self.text_entry.insert(insert_index, snippet)
+        if cursor_offset:
+            new_pos = f"{insert_index}+{len(snippet)}c{cursor_offset:+d}c"
+            try:
+                self.text_entry.mark_set(tk.INSERT, new_pos)
+            except tk.TclError:
+                pass
+        self.text_entry.focus_set()
+
+    def _choose_color(self):
+        from tkinter.colorchooser import askcolor
+        current = self.var_color.get() or "black"
+        color = askcolor(initialcolor=current, title="Choose Text Color")
+        if color[1]:
+            self.var_color.set(color[1])
+
+    def _confirm(self):
+        raw_text = self.text_entry.get("1.0", "end-1c").strip()
+        if not raw_text:
+            self.result = None
+            self.destroy()
+            return
+
+        is_mathtext = raw_text.startswith('$') and raw_text.endswith('$') and len(raw_text) >= 2
+        if self.var_underline.get():
+            # Native matplotlib Text has no underline property outside
+            # mathtext -- route underline through \underline{} either way.
+            inner = raw_text[1:-1] if is_mathtext else f"\\mathrm{{{raw_text}}}"
+            raw_text = f"$\\underline{{{inner}}}$"
+
+        self.result = {
+            'text': raw_text,
+            'color': self.var_color.get() or 'black',
+            'fontsize': self.var_fontsize.get(),
+            'bold': self.var_bold.get(),
+            'italic': self.var_italic.get(),
+            'family': self.var_family.get() or 'sans-serif',
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class PlotViewer(tk.Toplevel):
     def __init__(self, master, data_tuples, title, out_dir=None):
         super().__init__(master)
@@ -372,10 +720,42 @@ class PlotViewer(tk.Toplevel):
         self.var_prominence = tk.DoubleVar(value=10.2)
         self.var_title = tk.StringVar(value=state.global_set.get('title', ''))
 
+        # --- Annotation tool state (arrows/shapes/text on the graph) ---
+        self.var_ann_tool = tk.StringVar(value='none')
+        self.var_ann_text = tk.StringVar(value='')
+        self.var_ann_color = tk.StringVar(value='black')
+        self.var_ann_lw = tk.DoubleVar(value=2.0)
+        self.var_ann_fontsize = tk.DoubleVar(value=12.0)
+        self.var_ann_bold = tk.BooleanVar(value=False)
+        self.var_ann_italic = tk.BooleanVar(value=False)
+        self.var_ann_alpha = tk.DoubleVar(value=1.0)
+
         self.cursors = []
         self.baseline_pts = []
+        self.ax = None  # NEW: primary axis, set in update_plot(); used by cursor readout + annotations
         
         self.build_layout()
+
+        # Focus the canvas on every click so keyboard shortcuts (Delete,
+        # arrow-key nudge, Ctrl+C/V) reliably reach AnnotationManager --
+        # Tkinter only routes key events to whichever widget last had focus.
+        self.canvas.mpl_connect('button_press_event', lambda e: self.canvas.get_tk_widget().focus_set())
+
+        # Annotation manager owns arrow/shape/text drawing on the canvas.
+        # Created here (once) so it survives update_plot()'s repeated
+        # fig.clear() calls -- only the *axis* it's attached to changes.
+        self.annotation_mgr = AnnotationManager(
+            self.canvas,
+            on_select_callback=self.on_annotation_selected,
+            on_list_update_callback=self.sync_annotation_listbox,
+            on_tool_change_callback=self.on_annotation_tool_change,
+            text_input_provider=self.show_text_annotation_dialog,
+        )
+        # If this viewer was opened from a loaded session, annotations saved
+        # in that session live here until the first update_plot() call
+        # restores them onto a real axis.
+        self._pending_annotation_load = state.global_set.get('annotations') or []
+
         self.build_controls()
         self.load_active_settings()
         
@@ -383,7 +763,7 @@ class PlotViewer(tk.Toplevel):
         self.update_plot()
 
     def build_layout(self):
-        self.control_frame = ttk.Frame(self, width=400)
+        self.control_frame = ttk.Frame(self, width=460)  # widened from 400 -- west-side tabs (see build_controls) eat some of this for the tab strip itself
         self.control_frame.pack(side="left", fill="y", padx=5, pady=5)
         self.control_frame.pack_propagate(False)
         
@@ -492,6 +872,12 @@ class PlotViewer(tk.Toplevel):
         style = ttk.Style()
         style.configure("TLabelframe", padding=2) 
         style.configure("TButton", padding=2)     
+        # Tabs on the left instead of along the top: with 4 tabs (and more
+        # likely coming as features grow) horizontal tabs start truncating
+        # labels in a 400px-wide control panel. West-side tabs scale to more
+        # tabs without getting cramped -- labels stay horizontal (not
+        # rotated), just stacked top-to-bottom instead of left-to-right.
+        style.configure("TNotebook", tabposition='wn')
 
         self._build_bottom_buttons()
 
@@ -499,15 +885,37 @@ class PlotViewer(tk.Toplevel):
         
         self.tab_file = self._create_scrollable_tab(self.notebook, "File Settings")
         self.tab_axes = self._create_scrollable_tab(self.notebook, "Axes & Style")
+        self.tab_annotate = self._create_scrollable_tab(self.notebook, "Annotations")
         self.tab_tools = self._create_scrollable_tab(self.notebook, "Peaks & Export")
         
         self._build_file_tab()
         self._build_axes_tab()
+        self._build_annotation_tab()
         self._build_tools_tab()
 
         self.notebook.pack(side="top", fill="both", expand=True)
 
     def _build_file_tab(self):
+        # --- Manage Data: add/remove/replace files without closing the window ---
+        manage_frame = ttk.LabelFrame(self.tab_file, text="Manage Data", padding=5)
+        manage_frame.pack(fill="x", pady=(5, 10))
+
+        btn_row = ttk.Frame(manage_frame)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="➕ Add File(s)", command=self.add_files).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(btn_row, text="🔁 Replace Current", command=self.replace_current_file).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(btn_row, text="➖ Remove Current", command=self.remove_current_file).pack(side="left", expand=True, fill="x", padx=2)
+
+        # Reorder controls only make sense in Stack mode; shown/hidden dynamically
+        # since mode can now change mid-session via "Add File(s)" -> Overlay/Stack.
+        self.stack_reorder_frame = ttk.Frame(manage_frame)
+        reorder_row = ttk.Frame(self.stack_reorder_frame)
+        reorder_row.pack(fill="x")
+        ttk.Label(reorder_row, text="Reorder in Stack:").pack(side="left")
+        ttk.Button(reorder_row, text="⬆️ Move Up", command=self.move_stem_up).pack(side="left", padx=4)
+        ttk.Button(reorder_row, text="⬇️ Move Down", command=self.move_stem_down).pack(side="left", padx=4)
+        self._refresh_stack_reorder_visibility()
+
         ttk.Label(self.tab_file, text="Select File to Edit:").pack(anchor="w", pady=(5,0))
         self.cb_files = ttk.Combobox(self.tab_file, values=self.stems, state="readonly")
         self.cb_files.set(self.current_stem)
@@ -662,15 +1070,287 @@ class PlotViewer(tk.Toplevel):
         
         ttk.Button(self.tab_axes, text="Apply Global Settings", command=self.save_and_update).pack(pady=5)
 
+    def _build_annotation_tab(self):
+        ttk.Label(self.tab_annotate, text="Drawing Tools:").pack(anchor="w", pady=(5, 0))
+
+        tool_frame = ttk.Frame(self.tab_annotate)
+        tool_frame.pack(fill="x", pady=2)
+
+        tools = [
+            ("↖ Select / Move", "none"),
+            ("▭ Rectangle", "rect"),
+            ("◯ Circle / Ellipse", "circle"),
+            ("╱ Line", "line"),
+            ("➔ Arrow", "arrow"),
+            ("🅣 Text Box", "text"),
+        ]
+        for label, val in tools:
+            ttk.Radiobutton(tool_frame, text=label, variable=self.var_ann_tool, value=val,
+                             command=self.set_annotation_tool).pack(anchor="w")
+
+        ttk.Label(self.tab_annotate,
+                  text="Click+drag to draw. Clicking an EXISTING shape (with\nany tool active) selects it and switches to Select/Move.",
+                  font=("Arial", 8), foreground="gray", justify="left").pack(anchor="w", pady=(2, 8))
+
+        ttk.Label(self.tab_annotate,
+                  text="With an object selected: drag or arrow-keys to move,\nDelete/Backspace to remove, Ctrl+C/V to copy-paste.",
+                  font=("Arial", 8), foreground="gray", justify="left").pack(anchor="w", pady=(0, 8))
+
+        # --- Properties panel for the currently-selected shape ---
+        prop_frame = ttk.LabelFrame(self.tab_annotate, text="Selected Object Properties", padding=5)
+        prop_frame.pack(fill="x", pady=5)
+
+        ttk.Label(prop_frame, text="Text (text boxes only):").pack(anchor="w")
+        text_row = ttk.Frame(prop_frame)
+        text_row.pack(fill="x", pady=(0, 4))
+        ttk.Entry(text_row, textvariable=self.var_ann_text).pack(side="left", fill="x", expand=True)
+        ttk.Button(text_row, text="✏️ Rich Edit...", command=self.edit_selected_text_annotation).pack(side="left", padx=(4, 0))
+
+        color_row = ttk.Frame(prop_frame)
+        color_row.pack(fill="x", pady=2)
+        ttk.Label(color_row, text="Color:").pack(side="left")
+        ttk.Entry(color_row, textvariable=self.var_ann_color, width=10).pack(side="left", padx=4)
+        ttk.Button(color_row, text="🎨", width=3, command=self.choose_annotation_color).pack(side="left")
+
+        lw_row = ttk.Frame(prop_frame)
+        lw_row.pack(fill="x", pady=2)
+        ttk.Label(lw_row, text="Line Width:").pack(side="left")
+        ttk.Entry(lw_row, textvariable=self.var_ann_lw, width=6).pack(side="left", padx=4)
+        ttk.Label(lw_row, text="Font Size:").pack(side="left", padx=(10, 0))
+        ttk.Entry(lw_row, textvariable=self.var_ann_fontsize, width=6).pack(side="left", padx=4)
+
+        style_row = ttk.Frame(prop_frame)
+        style_row.pack(fill="x", pady=2)
+        ttk.Checkbutton(style_row, text="Bold", variable=self.var_ann_bold).pack(side="left")
+        ttk.Checkbutton(style_row, text="Italic", variable=self.var_ann_italic).pack(side="left", padx=10)
+
+        alpha_row = ttk.Frame(prop_frame)
+        alpha_row.pack(fill="x", pady=2)
+        ttk.Label(alpha_row, text="Opacity (0-1):").pack(side="left")
+        ttk.Entry(alpha_row, textvariable=self.var_ann_alpha, width=6).pack(side="left", padx=4)
+
+        ttk.Button(prop_frame, text="✅ Apply Properties", command=self.apply_annotation_properties).pack(fill="x", pady=(5, 0))
+        ttk.Button(prop_frame, text="🗑️ Delete Selected", command=self.delete_selected_annotation).pack(fill="x", pady=2)
+
+        # --- Annotation grid: each shape shown as a small card with a radio
+        # indicator, laid out in a grid rather than a plain vertical list.
+        # Clicking a card selects that shape (same as clicking it on the
+        # graph); switching to Select/Move via the tool radio above clears
+        # the highlight here (see set_annotation_tool()). ---
+        list_frame = ttk.LabelFrame(self.tab_annotate, text="All Annotations", padding=5)
+        list_frame.pack(fill="both", expand=True, pady=5)
+
+        ann_canvas = tk.Canvas(list_frame, highlightthickness=0, height=190)
+        ann_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=ann_canvas.yview)
+        self.ann_grid_frame = ttk.Frame(ann_canvas)
+        ann_canvas.configure(yscrollcommand=ann_scrollbar.set)
+        ann_canvas_window = ann_canvas.create_window((0, 0), window=self.ann_grid_frame, anchor="nw")
+        self.ann_grid_frame.bind("<Configure>", lambda e: ann_canvas.configure(scrollregion=ann_canvas.bbox("all")))
+        ann_canvas.bind("<Configure>", lambda e: ann_canvas.itemconfig(ann_canvas_window, width=e.width))
+        ann_canvas.pack(side="left", fill="both", expand=True)
+        ann_scrollbar.pack(side="right", fill="y")
+
+        self.var_ann_selected_idx = tk.IntVar(value=-1)  # -1 = nothing selected
+
+    def set_annotation_tool(self):
+        """Called when the user picks a drawing tool in the Annotations tab.
+        Keeps annotation tools and the analysis tools (peak/area/baseline/
+        deconv) mutually exclusive so a click can't be interpreted by both.
+        Switching to Select/Move here also deactivates any currently
+        selected object (AnnotationManager.set_tool() always clears
+        selection on a tool switch) -- the grid highlight below follows via
+        on_annotation_selected(None, None)."""
+        self.var_click_mode.set('none')
+        self.annotation_mgr.set_tool(self.var_ann_tool.get())
+        self.update_plot()
+
+    def on_annotation_tool_change(self, tool):
+        """Callback AnnotationManager fires when IT changes tool internally
+        (auto-switch to Select/Move after clicking an existing shape).
+        Keeps the Annotations tab's radio buttons in sync -- this is a
+        plain StringVar.set(), which does NOT re-invoke set_annotation_tool()
+        (Tkinter only calls a Radiobutton's `command` when the button itself
+        is clicked, not on programmatic variable writes), so this can't loop
+        back and clear the selection AnnotationManager just made."""
+        if hasattr(self, 'var_ann_tool'):
+            self.var_ann_tool.set(tool)
+
+    def set_click_mode(self, *_):
+        """Called when the user picks an analysis tool (Navigation/Peak/Area/
+        Baseline/Deconv/XRD) in the Peaks & Export tab. Mirror of
+        set_annotation_tool() -- keeps the two tool families mutually
+        exclusive."""
+        if hasattr(self, 'var_ann_tool'):
+            self.var_ann_tool.set('none')
+        if hasattr(self, 'annotation_mgr'):
+            self.annotation_mgr.set_tool('none')
+        self.update_plot()
+
+    def choose_annotation_color(self):
+        from tkinter.colorchooser import askcolor
+        current = self.var_ann_color.get() or "black"
+        color = askcolor(initialcolor=current, title="Choose Annotation Color")
+        if color[1]:
+            self.var_ann_color.set(color[1])
+
+    def apply_annotation_properties(self):
+        if not self.annotation_mgr.selected_artist:
+            messagebox.showinfo("No Selection", "Switch to Select mode and click an annotation first.", parent=self)
+            return
+
+        props = {}
+        if self.var_ann_color.get():
+            props['color'] = self.var_ann_color.get()
+        try:
+            props['linewidth'] = float(self.var_ann_lw.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            props['alpha'] = float(self.var_ann_alpha.get())
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            props['fontsize'] = float(self.var_ann_fontsize.get())
+        except (ValueError, tk.TclError):
+            pass
+        props['bold'] = self.var_ann_bold.get()
+        props['italic'] = self.var_ann_italic.get()
+        if self.var_ann_text.get():
+            props['text'] = self.var_ann_text.get()
+        # text_alpha / box_alpha / show_border are text-specific extras the
+        # AnnotationManager supports but this panel doesn't expose controls
+        # for yet -- fine to omit, update_selected_properties() only touches
+        # keys that are present in props.
+
+        self.annotation_mgr.update_selected_properties(props)
+
+    def delete_selected_annotation(self):
+        self.annotation_mgr.delete_selected()
+
+    def show_text_annotation_dialog(self, parent_window):
+        """The rich text-composition dialog, passed to AnnotationManager as
+        its text_input_provider -- called when the user draws a new text box.
+        Returns a dict (text/color/fontsize/bold/italic) or None if cancelled."""
+        dialog = TextAnnotationDialog(parent_window)
+        parent_window.wait_window(dialog)
+        return dialog.result
+
+    def edit_selected_text_annotation(self):
+        """Reopens the rich text dialog, pre-filled, for the currently
+        selected text annotation -- lets you touch up formatting/Greek/
+        symbols after the fact rather than only at creation time."""
+        if not self.annotation_mgr.selected_artist:
+            messagebox.showinfo("No Selection", "Switch to Select mode and click a text annotation first.", parent=self)
+            return
+        artist, kind = self.annotation_mgr.selected_artist
+        if kind != 'text':
+            messagebox.showinfo("Not a Text Box", "The selected object isn't a text annotation.", parent=self)
+            return
+
+        dialog = TextAnnotationDialog(
+            self, initial_text=artist.get_text(), initial_color=self.var_ann_color.get(),
+            initial_fontsize=self.var_ann_fontsize.get(), initial_bold=self.var_ann_bold.get(),
+            initial_italic=self.var_ann_italic.get(),
+            initial_family=(artist.get_fontfamily()[0] if artist.get_fontfamily() else 'sans-serif')
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            self.annotation_mgr.update_selected_properties({
+                'text': dialog.result['text'],
+                'color': dialog.result['color'],
+                'fontsize': dialog.result['fontsize'],
+                'bold': dialog.result['bold'],
+                'italic': dialog.result['italic'],
+                'family': dialog.result['family'],
+            })
+            # Keep the plain Entry + panel in sync with what was just set.
+            self.var_ann_text.set(dialog.result['text'])
+            self.var_ann_color.set(dialog.result['color'])
+            self.var_ann_fontsize.set(dialog.result['fontsize'])
+            self.var_ann_bold.set(dialog.result['bold'])
+            self.var_ann_italic.set(dialog.result['italic'])
+
+    def _select_annotation_from_grid(self, idx):
+        """Fired when a card in the annotation grid is clicked. Behaves like
+        clicking the object on the graph: selects it AND switches the tool
+        to Select/Move (set directly, not via annotation_mgr.set_tool(),
+        which would immediately clear the selection we're about to make)."""
+        self.annotation_mgr.active_tool = 'none'
+        self.var_ann_tool.set('none')
+        self.annotation_mgr.select_by_index(idx)
+
+    def sync_annotation_listbox(self, annotations_list):
+        """Callback AnnotationManager fires whenever a shape is added/removed/
+        selected. Rebuilds the annotation grid (small radio-indicator cards,
+        wrapped across a fixed number of columns) rather than a plain list."""
+        if not hasattr(self, 'ann_grid_frame'):
+            return  # widgets not built yet (can fire during __init__ bootstrap)
+
+        for child in self.ann_grid_frame.winfo_children():
+            child.destroy()
+
+        icons = {'rect': '▭', 'circle': '◯', 'line': '╱', 'arrow': '➔', 'text': '🅣'}
+        cols = 3
+        for i, (artist, kind) in enumerate(annotations_list):
+            label_text = f"{icons.get(kind, '•')} {kind.capitalize()}"
+            if kind == 'text':
+                snippet = artist.get_text()[:12]
+                label_text += f'\n"{snippet}"'
+
+            card = ttk.Frame(self.ann_grid_frame, relief="groove", borderwidth=1)
+            card.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="nsew")
+
+            ttk.Radiobutton(
+                card, text=label_text, variable=self.var_ann_selected_idx, value=i,
+                command=lambda idx=i: self._select_annotation_from_grid(idx)
+            ).pack(padx=4, pady=4)
+
+        for c in range(cols):
+            self.ann_grid_frame.columnconfigure(c, weight=1)
+
+        # Reflect the current selection (if any) in the grid; -1 clears every radio.
+        if self.annotation_mgr.selected_artist and self.annotation_mgr.selected_artist in annotations_list:
+            self.var_ann_selected_idx.set(annotations_list.index(self.annotation_mgr.selected_artist))
+        else:
+            self.var_ann_selected_idx.set(-1)
+
+    def on_annotation_selected(self, artist, kind):
+        """Callback AnnotationManager fires on selection change; populates
+        the properties panel with the selected object's current values, and
+        clears the grid's radio highlight when nothing is selected (e.g.
+        after explicitly switching to Select/Move, or clicking empty space)."""
+        if not hasattr(self, 'var_ann_text'):
+            return  # widgets not built yet
+        if artist is None:
+            if hasattr(self, 'var_ann_selected_idx'):
+                self.var_ann_selected_idx.set(-1)  # deactivate grid highlight
+            return  # keep last-shown property values rather than blanking the panel
+        if kind == 'text':
+            self.var_ann_text.set(artist.get_text())
+            self.var_ann_color.set(artist.get_color())
+            self.var_ann_fontsize.set(artist.get_fontsize())
+            self.var_ann_bold.set(artist.get_fontweight() == 'bold')
+            self.var_ann_italic.set(artist.get_fontstyle() == 'italic')
+            self.var_ann_alpha.set(artist.get_alpha() or 1.0)
+        else:
+            self.var_ann_text.set("")
+            try:
+                raw_color = artist.get_color() if kind == 'line' else artist.get_edgecolor()
+                self.var_ann_color.set(mcolors.to_hex(raw_color))
+            except Exception:
+                pass
+            self.var_ann_lw.set(artist.get_linewidth())
+            self.var_ann_alpha.set(artist.get_alpha() or 1.0)
+
     def _build_tools_tab(self):
         ttk.Label(self.tab_tools, text="Interactive Tools:").pack(anchor="w", pady=(5,0))
         
         mode_frame = ttk.Frame(self.tab_tools)
         mode_frame.pack(fill="x", pady=2)
         
-        ttk.Radiobutton(mode_frame, text="Navigation (Zoom/Pan)", variable=self.var_click_mode, value='none', command=self.update_plot).pack(anchor="w")
+        ttk.Radiobutton(mode_frame, text="Navigation (Zoom/Pan)", variable=self.var_click_mode, value='none', command=self.set_click_mode).pack(anchor="w")
         
-        ttk.Radiobutton(mode_frame, text="Draw Manual Baseline", variable=self.var_click_mode, value='baseline', command=self.update_plot).pack(anchor="w")
+        ttk.Radiobutton(mode_frame, text="Draw Manual Baseline", variable=self.var_click_mode, value='baseline', command=self.set_click_mode).pack(anchor="w")
         
         base_btn_frame = ttk.Frame(mode_frame)
         base_btn_frame.pack(fill="x", pady=2)
@@ -678,10 +1358,10 @@ class PlotViewer(tk.Toplevel):
         ttk.Button(base_btn_frame, text="❌ Clear", width=8, command=self.clear_manual_baseline).pack(side="left", padx=2)
         
         if getattr(state, 'technique', 'FTIR') == 'FTIR':
-            ttk.Radiobutton(mode_frame, text="Pick Peak", variable=self.var_click_mode, value='peak', command=self.update_plot).pack(anchor="w")
-            ttk.Radiobutton(mode_frame, text="Calculate Area", variable=self.var_click_mode, value='area', command=self.update_plot).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Pick Peak", variable=self.var_click_mode, value='peak', command=self.set_click_mode).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Calculate Area", variable=self.var_click_mode, value='area', command=self.set_click_mode).pack(anchor="w")
             ttk.Button(self.tab_tools, text="📖 FT-IR Functional Group Cheat Sheet", command=self.show_cheat_sheet).pack(fill="x", pady=(5, 0))
-            ttk.Radiobutton(mode_frame, text="Peak Deconvolution", variable=self.var_click_mode, value='deconv', command=self.update_plot).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Peak Deconvolution", variable=self.var_click_mode, value='deconv', command=self.set_click_mode).pack(anchor="w")
 
             deconv_btn_frame = ttk.Frame(mode_frame)
             deconv_btn_frame.pack(fill="x", pady=2)
@@ -695,8 +1375,8 @@ class PlotViewer(tk.Toplevel):
             ttk.Button(auto_frame, text="Find", width=6, command=self.auto_find_peaks).pack(side="left")
 
         elif getattr(state, 'technique', 'FTIR') == 'XRD':
-            ttk.Radiobutton(mode_frame, text="Pick XRD Peak (Smart Snap)", variable=self.var_click_mode, value='xrd_peak', command=self.update_plot).pack(anchor="w")
-            ttk.Radiobutton(mode_frame, text="Calculate Peak Area", variable=self.var_click_mode, value='area', command=self.update_plot).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Pick XRD Peak (Smart Snap)", variable=self.var_click_mode, value='xrd_peak', command=self.set_click_mode).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Calculate Peak Area", variable=self.var_click_mode, value='area', command=self.set_click_mode).pack(anchor="w")
             
             xrd_options = ttk.Frame(self.tab_tools)
             xrd_options.pack(fill="x", pady=5)
@@ -711,6 +1391,16 @@ class PlotViewer(tk.Toplevel):
             ttk.Button(auto_xrd, text="Find", width=5, command=self.auto_find_xrd_peaks).pack(side="left", padx=2)
 
             ttk.Button(self.tab_tools, text="📊 Plot Grain Size Distribution", command=self.show_grain_size_chart).pack(fill="x", pady=5, ipady=5)
+
+        else:  # GENERAL -- lightweight generic tools (no technique-specific peak table / Scherrer calc)
+            ttk.Radiobutton(mode_frame, text="Pick Point", variable=self.var_click_mode, value='peak', command=self.set_click_mode).pack(anchor="w")
+            ttk.Radiobutton(mode_frame, text="Calculate Area", variable=self.var_click_mode, value='area', command=self.set_click_mode).pack(anchor="w")
+
+            auto_frame = ttk.LabelFrame(self.tab_tools, text="Auto-Find Peaks", padding=5)
+            auto_frame.pack(fill="x", pady=5)
+            ttk.Label(auto_frame, text="Prominence:").pack(side="left")
+            ttk.Entry(auto_frame, textvariable=self.var_prominence, width=5).pack(side="left", padx=5)
+            ttk.Button(auto_frame, text="Find", width=6, command=self.auto_find_peaks).pack(side="left")
             
         list_frame = ttk.LabelFrame(self.tab_tools, text="Saved Peaks", padding=5)
         list_frame.pack(fill="both", expand=True, pady=5)
@@ -868,7 +1558,13 @@ class PlotViewer(tk.Toplevel):
             messagebox.showerror("Save Error", f"An error occurred while launching the save sequence:\n{e}", parent=self)
 
     def sync_annotations_to_state(self):
-        pass
+        """Called by session.save_session() right before writing the JSON
+        file. Was a no-op before -- meaning drawn annotations were silently
+        never saved. Now actually pulls the live shapes out of
+        AnnotationManager into state.global_set['annotations'] (a key the
+        session schema already reserved for exactly this)."""
+        if hasattr(self, 'annotation_mgr'):
+            state.global_set['annotations'] = self.annotation_mgr.get_serialized_data()
 
     def reset_file_settings(self):
         self.var_offset.set(0.0)
@@ -938,7 +1634,8 @@ class PlotViewer(tk.Toplevel):
             try:
                 if var_csv.get():
                     data_path = save_dir / f"{self.current_stem}_processed.csv"
-                    csv_header = "Wavenumber,Intensity" if getattr(state, 'technique', 'FTIR') == 'FTIR' else "2-Theta,Intensity"
+                    tech = getattr(state, 'technique', 'FTIR')
+                    csv_header = "Wavenumber,Intensity" if tech == 'FTIR' else ("2-Theta,Intensity" if tech == 'XRD' else "X,Y")
                     np.savetxt(data_path, np.column_stack((x, y)), delimiter=",", header=csv_header, comments="")
                     
                 if var_txt.get():
@@ -983,6 +1680,23 @@ class PlotViewer(tk.Toplevel):
                                 f.write("Start 2-Theta\tEnd 2-Theta\tArea Value\n")
                                 for x1, x2, val in areas:
                                     f.write(f"{x1:.2f}\t\t{x2:.2f}\t\t{val:.4f}\n")
+
+                        else:  # GENERAL
+                            points = fs.get('labels', [])
+                            areas = fs.get('areas', [])
+
+                            f.write(f"--- Data Analysis Report for {self.current_stem} ---\n\n")
+                            if points:
+                                f.write("PICKED POINTS:\n")
+                                f.write("X\t\tY\n")
+                                for px, py, text in points:
+                                    f.write(f"{px:.4g}\t\t{py:.4g}\n")
+                                f.write("\n")
+                            if areas:
+                                f.write("INTEGRATED AREAS:\n")
+                                f.write("Start X\t\tEnd X\t\tArea Value\n")
+                                for x1, x2, val in areas:
+                                    f.write(f"{x1:.4g}\t\t{x2:.4g}\t\t{val:.4f}\n")
                 
                 if var_img.get():
                     fmt = var_fmt.get()
@@ -1006,7 +1720,12 @@ class PlotViewer(tk.Toplevel):
         x, y = self.get_processed_data_for_stem(self.current_stem)
         fs = state.file_set[self.current_stem]
         
-        if not fs.get('t2a', False): 
+        # FTIR %Transmittance conventionally shows peaks as downward dips
+        # (hence searching -y below); arbitrary GENERAL data has no such
+        # convention, so default to the more common upward-peak assumption.
+        if getattr(state, 'technique', 'FTIR') == 'GENERAL':
+            search_y = y
+        elif not fs.get('t2a', False): 
             search_y = -y  
         else:
             search_y = y   
@@ -1041,6 +1760,12 @@ class PlotViewer(tk.Toplevel):
             for i, (x1, x2, area) in enumerate(fs.get('areas', [])):
                 self.peak_listbox.insert(tk.END, f"Area: {area:.2f} (from {min(x1,x2):.1f}° to {max(x1,x2):.1f}°)")
 
+        else:  # GENERAL
+            for i, (px, py, text) in enumerate(fs.get('labels', [])):
+                self.peak_listbox.insert(tk.END, f"Point {i+1}: ({px:.4g}, {py:.4g})")
+            for i, (x1, x2, area) in enumerate(fs.get('areas', [])):
+                self.peak_listbox.insert(tk.END, f"Area: {area:.4g} (from {min(x1,x2):.4g} to {max(x1,x2):.4g})")
+
     def delete_selected_peak(self):
         sel = self.peak_listbox.curselection()
         if not sel: return
@@ -1060,7 +1785,16 @@ class PlotViewer(tk.Toplevel):
         elif getattr(state, 'technique', 'FTIR') == 'XRD':
             if idx < len(fs.get('xrd_peaks', [])):
                 fs['xrd_peaks'].pop(idx)
-                
+
+        else:  # GENERAL -- same list layout as FTIR (points then areas)
+            num_points = len(fs.get('labels', []))
+            if idx < num_points:
+                fs['labels'].pop(idx)
+            else:
+                area_idx = idx - num_points
+                if area_idx < len(fs.get('areas', [])):
+                    fs['areas'].pop(area_idx)
+
         self.update_plot()
 
     def clear_peaks(self):
@@ -1076,26 +1810,220 @@ class PlotViewer(tk.Toplevel):
     def _build_bottom_buttons(self):
         bot_frame = ttk.Frame(self.control_frame)
         bot_frame.pack(side="bottom", fill="x", pady=10)
-        
+        self.bottom_action_btn = ttk.Button(bot_frame)
+        self.bottom_action_btn.pack(fill="x", ipady=8)
+        self._refresh_bottom_button()
+
+    def _refresh_bottom_button(self):
+        """(Re)configures the bottom action button's label/command. Split out
+        from _build_bottom_buttons() so it can be re-called after the session
+        switches mode mid-flight (e.g. via 'Add File(s)' -> Overlay/Stack),
+        since that button was previously set once at __init__ and would go
+        stale."""
         is_last = False
         if state.settings.get('mode') == 'individual':
             current_idx = next((i for i, d in enumerate(state.all_data) if d[0] == self.stems[0]), 0)
             if current_idx == len(state.all_data) - 1:
                 is_last = True
-                
-        if state.settings.get('mode') != 'individual' or is_last:
-            btn_text = "✅ Finish & Close"
-            cmd = self.on_close
-        else:
-            btn_text = "Next Spectrum ➔"
-            cmd = self.next_spectrum
 
-        ttk.Button(bot_frame, text=btn_text, command=cmd).pack(fill="x", ipady=8)
-        
+        if state.settings.get('mode') != 'individual' or is_last:
+            self.bottom_action_btn.config(text="✅ Finish & Close", command=self.on_close)
+        else:
+            self.bottom_action_btn.config(text="Next Spectrum ➔", command=self.next_spectrum)
+
+    def _refresh_stack_reorder_visibility(self):
+        if state.settings.get('mode') == 'stack':
+            if not self.stack_reorder_frame.winfo_ismapped():
+                self.stack_reorder_frame.pack(fill="x", pady=(4, 0))
+        else:
+            if self.stack_reorder_frame.winfo_ismapped():
+                self.stack_reorder_frame.pack_forget()
+
+    def move_stem_up(self):
+        idx = self.stems.index(self.current_stem)
+        if idx == 0:
+            return
+        self.stems[idx - 1], self.stems[idx] = self.stems[idx], self.stems[idx - 1]
+        self.update_plot()
+
+    def move_stem_down(self):
+        idx = self.stems.index(self.current_stem)
+        if idx >= len(self.stems) - 1:
+            return
+        self.stems[idx + 1], self.stems[idx] = self.stems[idx], self.stems[idx + 1]
+        self.update_plot()
+
+    def _read_new_file(self, filepath):
+        """Reads a new file using whichever reader matches the current
+        technique -- shared with ir.py/xrd.py/general.py via readers.py."""
+        filepath = Path(filepath)
+        technique = getattr(state, 'technique', 'FTIR')
+        if technique == 'GENERAL':
+            from readers import read_generic_configured
+            fmt = state.general_format or {'delimiter': ',', 'skip_rows': 0, 'x_col': 0, 'y_col': 1}
+            return read_generic_configured(filepath, **fmt)
+        else:
+            from readers import robust_read_spectrum
+            return robust_read_spectrum(filepath)
+
+    def _init_new_file_settings(self, stem):
+        """Mirrors config.SessionState.init_file_settings()'s per-file defaults,
+        for a single file added after the initial session setup."""
+        colors = list(mcolors.TABLEAU_COLORS.values())
+        idx = len(state.file_set) % len(colors)
+        default_color = colors[idx] if state.settings.get('mode') == 'overlay' else 'black'
+        state.file_set[stem] = {
+            'custom_name': stem, 'color': default_color, 'offset': 0.0,
+            'smooth': state.settings.get('smooth', 15), 'labels': [], 'areas': [],
+            'do_baseline': False, 'als_lam': 100000, 'als_p': 0.05
+        }
+
+    def add_files(self):
+        mode = state.settings.get('mode', 'individual')
+
+        # Individual mode only ever shows one file -- adding another is
+        # ambiguous, so ask how it should be handled (replace / switch mode).
+        if mode == 'individual' and len(self.stems) > 0:
+            dialog = AddDataChoiceDialog(self)
+            self.wait_window(dialog)
+            if dialog.choice is None:
+                return
+            if dialog.choice == 'replace':
+                self.replace_current_file()
+                return
+            elif dialog.choice in ('overlay', 'stack'):
+                state.settings['mode'] = dialog.choice
+                # This window's outer main()-level loop (in ir.py/xrd.py/
+                # general.py) is a for-loop over state.all_data, still
+                # blocked on this very window via wait_window(). Appending
+                # new files below would otherwise get picked up by that
+                # loop's next iteration and open a second, stale
+                # individual-mode window once this one closes -- this flag
+                # tells that loop to stop instead.
+                state.mode_switched_mid_session = True
+                messagebox.showinfo("Mode Changed",
+                                     f"Switched this session to {dialog.choice.capitalize()} mode.\n"
+                                     f"Now pick the new file(s) to add.", parent=self)
+                self._refresh_stack_reorder_visibility()
+                self._refresh_bottom_button()
+
+        filetypes = [("Data files", "*.csv *.txt *.xlsx *.dat *.asr *.raw *.CSV *.TXT")]
+        new_paths = filedialog.askopenfilenames(title="Add Data File(s)", filetypes=filetypes)
+        if not new_paths:
+            return
+
+        added, failed = [], []
+        for path in new_paths:
+            try:
+                x, y = self._read_new_file(path)
+                if len(x) > 2:
+                    stem = Path(path).stem
+                    base_stem, n = stem, 1
+                    while stem in self.data_dict:  # avoid clobbering an already-open file with the same name
+                        stem = f"{base_stem}_{n}"
+                        n += 1
+                    self.data_dict[stem] = (x, y)
+                    self.stems.append(stem)
+                    state.all_data.append((stem, x, y))
+                    if stem not in state.file_set:
+                        self._init_new_file_settings(stem)
+                    added.append(stem)
+                else:
+                    failed.append(Path(path).name)
+            except Exception:
+                failed.append(Path(path).name)
+
+        if failed:
+            messagebox.showwarning("Some Files Skipped",
+                                    f"Could not read {len(failed)} file(s):\n" + "\n".join(failed[:10]),
+                                    parent=self)
+
+        if added:
+            self.cb_files['values'] = self.stems
+            self.current_stem = added[-1]
+            self.cb_files.set(self.current_stem)
+            self.load_active_settings()
+            self._refresh_bottom_button()
+            self.update_plot()
+
+    def replace_current_file(self):
+        filetypes = [("Data files", "*.csv *.txt *.xlsx *.dat *.asr *.raw")]
+        new_path = filedialog.askopenfilename(title="Replace Current File's Data", filetypes=filetypes)
+        if not new_path:
+            return
+        self._do_replace_current(new_path)
+
+    def _do_replace_current(self, new_path):
+        try:
+            x, y = self._read_new_file(new_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read file:\n{e}", parent=self)
+            return
+        if len(x) <= 2:
+            messagebox.showerror("Error", "That file did not contain enough numeric data.", parent=self)
+            return
+
+        stem = self.current_stem
+        self.data_dict[stem] = (x, y)
+        for i, d in enumerate(state.all_data):
+            if d[0] == stem:
+                state.all_data[i] = (stem, x, y)
+                break
+
+        # Keep display settings (color/offset/etc.) but clear anything that
+        # was computed against the OLD data -- peaks/areas/fits would now
+        # point at meaningless x/y locations relative to the new dataset.
+        fs = state.file_set.get(stem, {})
+        fs['labels'] = []
+        fs['areas'] = []
+        fs['deconvs'] = []
+        fs.pop('xrd_peaks', None)
+        fs.pop('manual_baseline_pts', None)
+
+        self.update_plot()
+        messagebox.showinfo("Replaced", f"'{stem}' now shows data from:\n{Path(new_path).name}", parent=self)
+
+    def remove_current_file(self):
+        if len(self.stems) <= 1:
+            messagebox.showwarning("Cannot Remove",
+                                    "At least one file must remain open. Close the window instead if you're done.",
+                                    parent=self)
+            return
+        if not messagebox.askyesno("Remove File", f"Remove '{self.current_stem}' from this session?", parent=self):
+            return
+
+        stem_to_remove = self.current_stem
+        self.stems.remove(stem_to_remove)
+        del self.data_dict[stem_to_remove]
+        state.all_data = [d for d in state.all_data if d[0] != stem_to_remove]
+        state.file_set.pop(stem_to_remove, None)
+
+        self.current_stem = self.stems[0]
+        self.cb_files['values'] = self.stems
+        self.cb_files.set(self.current_stem)
+        self.load_active_settings()
+        self._refresh_bottom_button()
+        self.update_plot()
+
     def next_spectrum(self):
         self.destroy() 
 
     def update_plot(self):
+        # update_plot() is called on nearly every settings change (offset,
+        # color, peak pick, tool switch, etc.) and always does a full
+        # self.fig.clear() below, which destroys every matplotlib artist --
+        # including any annotations the user has drawn. Snapshot them first
+        # so they can be re-attached to the freshly-rebuilt axis afterward.
+        ann_snapshot = None
+        if hasattr(self, 'annotation_mgr'):
+            ann_snapshot = self.annotation_mgr.get_serialized_data()
+            if not ann_snapshot and getattr(self, '_pending_annotation_load', None):
+                # First call after __init__: nothing drawn yet in this window,
+                # but a loaded session may have annotations waiting to be
+                # restored onto the axis we're about to create.
+                ann_snapshot = self._pending_annotation_load
+            self._pending_annotation_load = None
+
         self.fig.clear()
         self.cursors = [] 
         
@@ -1234,7 +2162,22 @@ class PlotViewer(tk.Toplevel):
             cursor = Cursor(ax, useblit=True, color='red', linewidth=1, linestyle='dotted')
             cursor.visible = self.var_click_mode.get() in ['peak', 'area', 'baseline', 'deconv']
             self.cursors.append(cursor)
-        
+
+        # NEW: self.ax was previously never assigned anywhere in this class,
+        # which silently broke the "X: -- | Y: --" cursor readout (it checks
+        # hasattr(self, 'ax'), which was always False). Fixed here, and this
+        # also gives annotations a stable axis to attach to.
+        # In stack mode, annotations attach only to the first (top) subplot --
+        # per-subplot annotation tracking in stack mode is a possible future
+        # enhancement, not yet supported.
+        self.ax = axes[0] if axes else None
+
+        if hasattr(self, 'annotation_mgr') and ann_snapshot:
+            self.annotation_mgr.annotations = []
+            self.annotation_mgr.selected_artist = None
+            if self.ax is not None:
+                self.annotation_mgr.load_serialized_data(ann_snapshot, self.ax)
+
         self.fig.tight_layout() 
         self.canvas.draw_idle()
         self.sync_peak_listbox()
@@ -1427,13 +2370,32 @@ class PlotViewer(tk.Toplevel):
                 pass 
                 
         if "exit" in dialog.choice:
+            # Safe here: this window's process was spawned in isolation by
+            # launcher.py via multiprocessing, so killing it doesn't touch the
+            # dashboard. os._exit() sidesteps a known Tkinter teardown hang when
+            # several Toplevels + matplotlib canvases are open, at the cost of
+            # skipping atexit/cleanup handlers (harmless -- all file writes in
+            # this app already use 'with open(...)', which flush on their own).
             import os
             os._exit(0) 
             
         elif "menu" in dialog.choice:
-            import sys
-            import os
-            os.execl(sys.executable, sys.executable, *sys.argv)
+            # CHANGED: this used to do
+            #   os.execl(sys.executable, sys.executable, *sys.argv)
+            # which re-executes the *current* interpreter with the *current*
+            # sys.argv. That is broken for this app's process model: ir.main()/
+            # xrd.main() run inside a child process spawned by launcher.py via
+            # multiprocessing.Process. On Windows (and frozen/PyInstaller builds
+            # everywhere), that child's sys.argv holds multiprocessing's internal
+            # bootstrap flags (e.g. "--multiprocessing-fork <handle>"), not the
+            # original script path -- re-exec'ing with those stale handles
+            # crashes or hangs instead of relaunching the setup screen.
+            #
+            # Fix: signal the request via shared state instead of touching the
+            # process at all. main()'s loop (in ir.py / xrd.py) checks this flag
+            # after each viewer closes and, if set, unwinds back to SetupGUI.
+            state.restart_to_menu = True
+            self.destroy()
     
     def calculate_xrd_peak(self, x_click, x_arr, y_arr):
         mask = (x_arr >= x_click - 1.0) & (x_arr <= x_click + 1.0)
